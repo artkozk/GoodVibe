@@ -55,3 +55,4 @@ OPENAI_RULES = (
 FEEDBACK_PATH = "feedback_stats.json"
 MODEL_PATH = "adaptive_model_state.json"
 STATE_PATH = "bot_state.json"
+CHAT_LOG_PATH = "chat_memory.jsonl"

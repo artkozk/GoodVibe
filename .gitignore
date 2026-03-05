@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local runtime/state files
+*.log
+*.tmp
+feedback_stats.json
+adaptive_model_state.json
+bot_state.json
+
+# OS
+.DS_Store
+Thumbs.db
+

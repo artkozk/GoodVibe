@@ -12,10 +12,11 @@ import tempfile
 import time
 from difflib import SequenceMatcher
 from dataclasses import dataclass
-from datetime import time as dtime
+from datetime import datetime, time as dtime
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
+import httpx
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -55,6 +56,7 @@ class BotConfig:
     feedback_path: str
     model_path: str
     state_path: str
+    chat_log_path: str
     openai_enabled: bool
     openai_api_key: str
     openai_base_url: str
@@ -77,7 +79,77 @@ NON_ADMIN_TEXT = "такое вообще то пишут с душой!"
 GROUP_CHAT_REPLY_COOLDOWN_SEC = 25.0
 GROUP_CHAT_REPLY_CHANCE = 0.24
 GROUP_REACTION_EMOJI = "🔥"
+GROUP_QUERY_PREFIX = "@v"
+GROUP_QUERY_TIMEOUT_SEC = 12.0
 WISH_HEART_EMOJIS = ("❤️", "💖", "💗", "💕", "💞", "💘", "💝", "🩷")
+GROUP_CONTEXT_POSITIVE_REACTIONS = ("❤️", "💯", "👏", "🫶", "✨", "👍")
+GROUP_CONTEXT_NEUTRAL_REACTIONS = ("👀", "🤔", "🧠", "👌", "🫡", "😌")
+GROUP_CONTEXT_NEGATIVE_REACTIONS = ("😏", "🙃", "🧊", "😬", "🤨")
+GROUP_CONTEXT_FUN_REACTIONS = ("😂", "🤣", "😹", "🔥")
+SOCIAL_WARM_REACTIONS = ("❤️", "💖", "🫶", "🥰", "🤝")
+SOCIAL_COLD_REACTIONS = ("🤨", "😏", "🙃", "🧊")
+FRIENDLY_MARKERS = (
+    "спасибо",
+    "благодар",
+    "люблю",
+    "обнимаю",
+    "красава",
+    "умница",
+    "молодец",
+    "доброе утро",
+    "спокойной ночи",
+    "сладких снов",
+    "доброй ночи",
+    "пожалуйста",
+)
+RUDE_MARKERS = (
+    "туп",
+    "дура",
+    "дурак",
+    "идиот",
+    "дебил",
+    "мудак",
+    "бесишь",
+    "заткни",
+    "ненавижу",
+    "пошел",
+    "пошёл",
+    "урод",
+    "говно",
+)
+THANKS_MARKERS = ("спасибо", "благодар", "сенкс", "пасиб")
+LAUGH_MARKERS = ("ахах", "лол", "ржу", "смешно", "хаха")
+FORGIVE_MARKERS = ("прости", "извини", "сорян", "сорри", "простишь", "прощения")
+HOSTILE_FORCE_REPLY_SCORE = -70
+HOSTILE_SILENCE_BREAK_CHANCE = 0.65
+AMSTERDAM_MARKERS = ("амстердам", "amsterdam")
+CITY_TIMEZONE_MAP = {
+    "москва": "Europe/Moscow",
+    "питер": "Europe/Moscow",
+    "санкт петербург": "Europe/Moscow",
+    "киев": "Europe/Kyiv",
+    "минск": "Europe/Minsk",
+    "астана": "Asia/Almaty",
+    "алматы": "Asia/Almaty",
+    "екатеринбург": "Asia/Yekaterinburg",
+    "новосибирск": "Asia/Novosibirsk",
+    "владивосток": "Asia/Vladivostok",
+    "лондон": "Europe/London",
+    "берлин": "Europe/Berlin",
+    "париж": "Europe/Paris",
+    "рим": "Europe/Rome",
+    "мадрид": "Europe/Madrid",
+    "амстердам": "Europe/Amsterdam",
+    "амстердаме": "Europe/Amsterdam",
+    "new york": "America/New_York",
+    "нью йорк": "America/New_York",
+    "лос анджелес": "America/Los_Angeles",
+    "лос анжелес": "America/Los_Angeles",
+    "чикаго": "America/Chicago",
+    "токио": "Asia/Tokyo",
+    "сеул": "Asia/Seoul",
+    "дубай": "Asia/Dubai",
+}
 WISH_REACTION_KEYWORDS = (
     "доброе утро",
     "с добрым утром",
@@ -96,6 +168,7 @@ EMOJI_SEQUENCE_RE = re.compile(
     r"(?:[\U0001F1E6-\U0001F1FF]{2}|[\U0001F300-\U0001FAFF\u2600-\u27BF]"
     r"(?:\uFE0F)?(?:\u200D[\U0001F300-\U0001FAFF\u2600-\u27BF](?:\uFE0F)?)*)"
 )
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -125,6 +198,7 @@ def _load_config() -> BotConfig:
     feedback_path = str(getattr(cfg, "FEEDBACK_PATH", "feedback_stats.json")).strip()
     model_path = str(getattr(cfg, "MODEL_PATH", "adaptive_model_state.json")).strip()
     state_path = str(getattr(cfg, "STATE_PATH", "bot_state.json")).strip()
+    chat_log_path = str(getattr(cfg, "CHAT_LOG_PATH", "chat_memory.jsonl")).strip()
     openai_api_key = str(getattr(cfg, "OPENAI_API_KEY", "")).strip()
     openai_base_url = str(getattr(cfg, "OPENAI_BASE_URL", "https://api.openai.com/v1")).strip()
     openai_model = str(getattr(cfg, "OPENAI_MODEL", "gpt-4.1-mini")).strip()
@@ -158,6 +232,7 @@ def _load_config() -> BotConfig:
         feedback_path=feedback_path,
         model_path=model_path,
         state_path=state_path,
+        chat_log_path=chat_log_path or "chat_memory.jsonl",
         openai_enabled=bool(openai_enabled and openai_api_key),
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url or "https://api.openai.com/v1",
@@ -231,6 +306,238 @@ def _group_reply_meta(context: ContextTypes.DEFAULT_TYPE) -> dict[str, float]:
 
 def _reaction_cursor(context: ContextTypes.DEFAULT_TYPE) -> dict[str, int]:
     return context.application.bot_data.setdefault("reaction_cursor", {})
+
+
+def _chat_log_file_path(context: ContextTypes.DEFAULT_TYPE) -> str:
+    config = _get_config(context)
+    path = str(config.chat_log_path or "chat_memory.jsonl").strip()
+    if os.path.isabs(path):
+        return path
+    return os.path.join(os.getcwd(), path)
+
+
+def _append_chat_log_row(context: ContextTypes.DEFAULT_TYPE, row: dict) -> None:
+    try:
+        path = _chat_log_file_path(context)
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        payload = dict(row)
+        payload.setdefault("ts", datetime.now(ZoneInfo("UTC")).isoformat())
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logging.warning("Cannot write chat log: %s", exc)
+
+
+def _iter_chat_log_rows(context: ContextTypes.DEFAULT_TYPE, *, reverse: bool = False) -> list[dict]:
+    path = _chat_log_file_path(context)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except Exception:
+        return []
+    if reverse:
+        lines = list(reversed(lines))
+    out: list[dict] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
+def _chat_log_quick_stats(context: ContextTypes.DEFAULT_TYPE) -> tuple[int, int]:
+    rows = _iter_chat_log_rows(context, reverse=False)
+    users: set[int] = set()
+    for row in rows:
+        uid = int(row.get("user_id", 0) or 0)
+        if uid:
+            users.add(uid)
+    return len(rows), len(users)
+
+
+def _message_content_type(message: object) -> str:
+    if getattr(message, "text", None):
+        return "text"
+    if getattr(message, "voice", None):
+        return "voice"
+    if getattr(message, "video_note", None):
+        return "video_note"
+    if getattr(message, "video", None):
+        return "video"
+    if getattr(message, "sticker", None):
+        return "sticker"
+    if getattr(message, "document", None):
+        return "document"
+    if getattr(message, "photo", None):
+        return "photo"
+    if getattr(message, "audio", None):
+        return "audio"
+    return "other"
+
+
+def _message_text_or_caption(message: object) -> str:
+    text = str(getattr(message, "text", "") or "").strip()
+    if text:
+        return " ".join(text.split())
+    caption = str(getattr(message, "caption", "") or "").strip()
+    if caption:
+        return " ".join(caption.split())
+    return ""
+
+
+def _log_incoming_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+
+    row = {
+        "direction": "incoming",
+        "chat_id": int(getattr(chat, "id", 0) or 0),
+        "chat_type": str(getattr(chat, "type", "") or ""),
+        "chat_title": str(getattr(chat, "title", "") or ""),
+        "message_id": int(getattr(msg, "message_id", 0) or 0),
+        "reply_to_message_id": int(getattr(getattr(msg, "reply_to_message", None), "message_id", 0) or 0),
+        "user_id": int(getattr(user, "id", 0) or 0),
+        "username": str(getattr(user, "username", "") or ""),
+        "first_name": str(getattr(user, "first_name", "") or ""),
+        "last_name": str(getattr(user, "last_name", "") or ""),
+        "content_type": _message_content_type(msg),
+        "text": _message_text_or_caption(msg),
+    }
+    _append_chat_log_row(context, row)
+
+
+def _log_outgoing_message(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    chat_type: str,
+    message_id: int,
+    text: str,
+    source: str,
+    reply_to_message_id: int = 0,
+    peer_user_id: int = 0,
+) -> None:
+    me = getattr(context.bot, "id", 0) or 0
+    row = {
+        "direction": "outgoing",
+        "chat_id": int(chat_id),
+        "chat_type": str(chat_type or ""),
+        "message_id": int(message_id),
+        "reply_to_message_id": int(reply_to_message_id or 0),
+        "user_id": int(me),
+        "username": str(getattr(context.bot, "username", "") or ""),
+        "first_name": str(getattr(context.bot, "first_name", "") or ""),
+        "last_name": "",
+        "content_type": "text",
+        "text": " ".join(str(text or "").split()),
+        "source": str(source or ""),
+        "peer_user_id": int(peer_user_id or 0),
+    }
+    _append_chat_log_row(context, row)
+
+
+def _log_users_summary(context: ContextTypes.DEFAULT_TYPE, *, limit: int = 80) -> list[dict]:
+    rows = _iter_chat_log_rows(context, reverse=True)
+    by_user: dict[int, dict] = {}
+    for row in rows:
+        user_id = int(row.get("user_id", 0) or 0)
+        if not user_id:
+            continue
+        direction = str(row.get("direction", "")).strip().lower()
+        if direction != "incoming":
+            continue
+        if user_id not in by_user:
+            by_user[user_id] = {
+                "user_id": user_id,
+                "username": str(row.get("username", "") or ""),
+                "first_name": str(row.get("first_name", "") or ""),
+                "last_name": str(row.get("last_name", "") or ""),
+                "last_ts": str(row.get("ts", "") or ""),
+                "messages": 0,
+            }
+        by_user[user_id]["messages"] += 1
+    items = list(by_user.values())
+    items.sort(key=lambda x: (x.get("last_ts", ""), int(x.get("messages", 0))), reverse=True)
+    return items[: max(1, int(limit))]
+
+
+def _user_export_keyboard(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    users = _log_users_summary(context, limit=40)
+    rows: list[list[InlineKeyboardButton]] = []
+    for row in users:
+        uid = int(row.get("user_id", 0))
+        if not uid:
+            continue
+        name = " ".join(
+            part
+            for part in (
+                str(row.get("first_name", "")).strip(),
+                str(row.get("last_name", "")).strip(),
+            )
+            if part
+        )
+        if not name:
+            username = str(row.get("username", "")).strip()
+            name = f"@{username}" if username else str(uid)
+        label = f"{name} ({uid})"
+        if len(label) > 58:
+            label = f"{label[:55]}..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"menu|export_user|{uid}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("Пока нет логов", callback_data="menu|noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _is_primary_admin_user(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    admin_id = _effective_admin_user_id(context)
+    return bool(admin_id and int(user_id) == int(admin_id))
+
+
+def _safe_relation_delta(context: ContextTypes.DEFAULT_TYPE, user_id: int, delta: int) -> int:
+    if _is_primary_admin_user(context, user_id) and int(delta) < 0:
+        return 0
+    return int(delta)
+
+
+def _safe_relation_score(context: ContextTypes.DEFAULT_TYPE, user_id: int, score: int) -> int:
+    target = int(score)
+    if _is_primary_admin_user(context, user_id):
+        target = max(40, target)
+    return max(-100, min(100, target))
+
+
+def _ensure_admin_relation_floor(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: BotStateStore,
+    chat_id: int,
+    user_id: int,
+) -> dict | None:
+    if not _is_primary_admin_user(context, user_id):
+        return state.get_relation(chat_id=chat_id, user_id=user_id)
+    relation = state.get_relation(chat_id=chat_id, user_id=user_id)
+    if relation and int(relation.get("score", 0)) >= 40:
+        return relation
+    return state.set_relation_score(
+        chat_id=chat_id,
+        user_id=user_id,
+        score=40,
+        reason="админ всегда в плюс-статусе",
+    )
 
 
 def _append_group_dialogue(context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, line: str, limit: int = 180) -> None:
@@ -346,6 +653,328 @@ def _extract_style_examples_from_text(raw_text: str, limit: int = 5000) -> list[
         if len(out) >= max(50, limit):
             break
     return out
+
+
+def _clean_html_fragment(raw: str) -> str:
+    if not raw:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", str(raw))
+    text = re.sub(r"(?i)</p>", "\n", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = text.replace("\xa0", " ")
+    return " ".join(text.split())
+
+
+def _extract_style_examples_from_export_html(
+    raw_html: str,
+    *,
+    author_hints: list[str] | None = None,
+    limit: int = 5000,
+) -> list[str]:
+    source = str(raw_html or "")
+    if not source:
+        return []
+
+    hints = []
+    for hint in author_hints or []:
+        clean = " ".join(str(hint).strip().lower().replace("ё", "е").split())
+        if clean:
+            hints.append(clean)
+
+    rows: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r'<div class="from_name">\s*(.*?)\s*</div>.*?<div class="text"[^>]*>\s*(.*?)\s*</div>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for from_html, text_html in pattern.findall(source):
+        author = _clean_html_fragment(from_html)
+        text = _clean_html_fragment(text_html)
+        if len(text) < 4:
+            continue
+        rows.append((author, text))
+
+    if not rows:
+        text_pattern = re.compile(r'<div class="text"[^>]*>\s*(.*?)\s*</div>', re.IGNORECASE | re.DOTALL)
+        for text_html in text_pattern.findall(source):
+            text = _clean_html_fragment(text_html)
+            if len(text) >= 4:
+                rows.append(("", text))
+
+    if not rows:
+        return []
+
+    if hints:
+        filtered: list[tuple[str, str]] = []
+        for author, text in rows:
+            author_norm = " ".join(author.lower().replace("ё", "е").split())
+            if any(hint and hint in author_norm for hint in hints):
+                filtered.append((author, text))
+        if filtered:
+            rows = filtered
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, text in rows:
+        line = " ".join(text.split())
+        if len(line) < 4:
+            continue
+        norm = line.lower().replace("ё", "е")
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(line)
+        if len(out) >= max(50, limit):
+            break
+    return out
+
+
+def _social_mode_ru(mode: str) -> str:
+    clean = str(mode or "").strip().lower()
+    if clean == "style_clone":
+        return "как я (по экспорту)"
+    return "самообучение по людям"
+
+
+def _relation_status_ru(status: str) -> str:
+    clean = str(status or "").strip().lower()
+    if clean == "friendly":
+        return "дружелюбно"
+    if clean == "warm":
+        return "тепло"
+    if clean == "cold":
+        return "холодно"
+    if clean == "hostile":
+        return "конфликт"
+    return "нейтрально"
+
+
+def _relation_display_name(relation: dict) -> str:
+    first = str(relation.get("first_name", "")).strip()
+    last = str(relation.get("last_name", "")).strip()
+    username = str(relation.get("username", "")).strip()
+    full = f"{first} {last}".strip()
+    if full:
+        return full
+    if username:
+        return f"@{username}" if not username.startswith("@") else username
+    return str(relation.get("user_id", "пользователь"))
+
+
+def _relation_summary_for_prompt(relation: dict | None) -> str:
+    if not relation:
+        return "новый участник, рейтинг 0"
+    score = int(relation.get("score", 0))
+    status = _relation_status_ru(str(relation.get("status", "neutral")))
+    friendly_hits = int(relation.get("friendly_hits", 0))
+    rude_hits = int(relation.get("rude_hits", 0))
+    blocked = bool(relation.get("forgive_blocked", False))
+    grudges = relation.get("grudges", [])
+    if not isinstance(grudges, list):
+        grudges = []
+    last_reason = " ".join(str(relation.get("last_reason", "")).split())
+    grudge_hint = ", ".join(str(x) for x in grudges[-3:] if str(x).strip())
+    parts = [
+        f"рейтинг={score}",
+        f"статус={status}",
+        f"доброжелательных сигналов={friendly_hits}",
+        f"грубых сигналов={rude_hits}",
+        f"прощение заблокировано={'да' if blocked else 'нет'}",
+    ]
+    if last_reason:
+        parts.append(f"последняя причина={last_reason}")
+    if grudge_hint:
+        parts.append(f"обиды={grudge_hint}")
+    return "; ".join(parts)
+
+
+def _has_any_marker(plain_text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in plain_text for marker in markers)
+
+
+def _is_forgive_request(text: str) -> bool:
+    plain = _plain_text_for_blacklist(text)
+    return _has_any_marker(plain, FORGIVE_MARKERS)
+
+
+def _relation_signal(text: str) -> tuple[int, str]:
+    plain = _plain_text_for_blacklist(text)
+    if not plain:
+        return 0, ""
+
+    tokens = plain.split()
+    positive_hits = sum(1 for marker in FRIENDLY_MARKERS if marker in plain)
+    negative_hits = sum(1 for marker in RUDE_MARKERS if marker in plain)
+    delta = 0
+    reason = ""
+
+    if positive_hits:
+        delta += min(12, positive_hits * 4)
+        reason = "дружелюбный тон"
+    if negative_hits:
+        delta -= min(36, negative_hits * 9)
+        reason = "грубый тон"
+    if not positive_hits and not negative_hits and len(tokens) <= 2 and not _looks_like_question(text):
+        delta -= 2
+        reason = "сухой тон"
+    if _is_wish_like_text(text):
+        delta += 3
+        reason = "пожелание"
+    if _is_forgive_request(text):
+        reason = "запрос на прощение"
+    return delta, reason
+
+
+def _forgive_reply_for_relation(*, relation: dict, user_name: str) -> str:
+    score = int(relation.get("score", 0))
+    blocked = bool(relation.get("forgive_blocked", False))
+    prefix = f"{user_name}, " if user_name else ""
+
+    if score <= -65 or blocked:
+        choices = [
+            "я помню, за что злюсь. Пока не готов отпустить.",
+            "нет, тут быстро не починить. Осадок сильный.",
+            "пока без прощения. Я это не забыл.",
+        ]
+        return f"{prefix}{random.choice(choices)}"
+    if score < -18:
+        choices = [
+            "подумаю. Может позже отпущу ситуацию.",
+            "может быть, но не сразу. Дай время.",
+            "пока под вопросом. Посмотрим по делам.",
+        ]
+        return f"{prefix}{random.choice(choices)}"
+
+    choices = [
+        "та за что, ты меня не обижал. Все нормально.",
+        "да все ок, тут и прощать нечего.",
+        "спокойно, я не в обиде.",
+    ]
+    return f"{prefix}{random.choice(choices)}"
+
+
+def _extract_v_query(text: str) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith(GROUP_QUERY_PREFIX):
+        payload = raw[len(GROUP_QUERY_PREFIX) :].strip(" :,-")
+        return payload or None
+    return None
+
+
+def _city_from_time_query(query: str) -> str | None:
+    clean = _plain_text_for_blacklist(query)
+    if not clean:
+        return None
+    if any(marker in clean for marker in AMSTERDAM_MARKERS):
+        return "амстердам"
+    match = re.search(r"\bв\s+([a-zа-я0-9\-\s]{2,40})$", clean)
+    if match:
+        return " ".join(match.group(1).split())
+    if clean.startswith("время "):
+        return " ".join(clean.replace("время", "", 1).split())
+    return None
+
+
+def _resolve_timezone_by_city(city: str) -> str | None:
+    clean = " ".join(str(city or "").lower().replace("ё", "е").split())
+    if not clean:
+        return None
+    if clean in CITY_TIMEZONE_MAP:
+        return CITY_TIMEZONE_MAP[clean]
+    candidates = [
+        clean.replace(" ", "_"),
+        clean.title().replace(" ", "_"),
+        clean.capitalize().replace(" ", "_"),
+    ]
+    for candidate in candidates:
+        for prefix in ("Europe", "Asia", "America", "Africa", "Australia"):
+            tz = f"{prefix}/{candidate}"
+            try:
+                ZoneInfo(tz)
+                return tz
+            except Exception:
+                continue
+    return None
+
+
+def _time_answer_from_query(query: str) -> str | None:
+    plain = _plain_text_for_blacklist(query)
+    if not plain:
+        return None
+    if "врем" not in plain and "time" not in plain:
+        return None
+    city = _city_from_time_query(query)
+    if not city:
+        return None
+    tz_name = _resolve_timezone_by_city(city)
+    if not tz_name:
+        return None
+    try:
+        now_local = datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return None
+    city_title = city.title()
+    return f"{city_title}: {now_local.strftime('%H:%M')} ({tz_name}), {now_local.strftime('%d.%m.%Y')}"
+
+
+async def _web_lookup_answer(query: str) -> str:
+    timeout = httpx.Timeout(connect=4.0, read=GROUP_QUERY_TIMEOUT_SEC, write=8.0, pool=4.0)
+    params = {
+        "q": query,
+        "format": "json",
+        "no_html": "1",
+        "skip_disambig": "1",
+        "no_redirect": "1",
+        "kl": "ru-ru",
+    }
+    url = "https://api.duckduckgo.com/"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url, params=params)
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    data = response.json()
+    candidates = [
+        str(data.get("Answer", "")).strip(),
+        str(data.get("AbstractText", "")).strip(),
+        str(data.get("Definition", "")).strip(),
+    ]
+    answer = next((value for value in candidates if value), "")
+    if not answer:
+        related = data.get("RelatedTopics", [])
+        if isinstance(related, list):
+            for item in related:
+                if isinstance(item, dict) and str(item.get("Text", "")).strip():
+                    answer = str(item["Text"]).strip()
+                    break
+                topics = item.get("Topics") if isinstance(item, dict) else None
+                if isinstance(topics, list):
+                    for sub in topics:
+                        if isinstance(sub, dict) and str(sub.get("Text", "")).strip():
+                            answer = str(sub["Text"]).strip()
+                            break
+                    if answer:
+                        break
+    if not answer:
+        return "Точного ответа не нашел. Уточни запрос."
+    if len(answer) > 500:
+        answer = f"{answer[:497]}..."
+    return answer
+
+
+async def _answer_v_query(query: str) -> str:
+    clean = " ".join(str(query or "").split())
+    if not clean:
+        return "Напиши запрос после @v."
+    time_answer = _time_answer_from_query(clean)
+    if time_answer:
+        return time_answer
+    try:
+        return await _web_lookup_answer(clean)
+    except Exception as exc:
+        logging.warning("@v lookup failed: %s", exc)
+        return "Не смог найти ответ сейчас. Попробуй переформулировать запрос."
 
 
 def _is_wish_like_text(text: str) -> bool:
@@ -731,6 +1360,9 @@ def _is_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool
     if _is_admin(update, context):
         return True
     state = _get_state(context)
+    chat = update.effective_chat
+    if chat and chat.type == "private" and state.is_public_private_chat_mode():
+        return True
     if not state.is_admin_only_mode():
         return True
     return state.has_access_exception(user.id)
@@ -815,6 +1447,16 @@ async def _ensure_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return False
 
 
+def _is_public_private_chat_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat or chat.type != "private":
+        return False
+    if _is_admin(update, context):
+        return False
+    return _get_state(context).is_public_private_chat_mode()
+
+
 def _reason_label(rating_code: str, reason_code: str) -> str:
     good_reasons = {
         "a": "понравилось всё",
@@ -879,14 +1521,20 @@ def _settings_keyboard(
     blacklist_count: int,
     group_reaction_mode: bool = False,
     group_chat_mode: bool = False,
+    public_private_chat_mode: bool = False,
     group_activity_mode: str = "normal",
     style_examples_count: int = 0,
+    social_mode: str = "self_learning",
+    roast_words_count: int = 0,
+    relations_count: int = 0,
 ) -> InlineKeyboardMarkup:
     access_label = "🔒 Только админ: ВКЛ" if admin_only_mode else "🔓 Только админ: ВЫКЛ"
     schedule_label = f"🕒 Рассылка: {_mode_ru(schedule_mode)}"
     reaction_label = f"🔥 Реакции на voice/video: {_on_off_ru(group_reaction_mode)}"
     chat_mode_label = f"💬 Общение в группе: {_on_off_ru(group_chat_mode)}"
+    public_chat_label = f"🗨 Личка для всех: {_on_off_ru(public_private_chat_mode)}"
     group_activity_label = f"🎚 Активность: {_group_activity_ru(group_activity_mode)}"
+    social_mode_label = f"🧠 Соц режим: {_social_mode_ru(social_mode)}"
     return InlineKeyboardMarkup(
         [
             [
@@ -909,16 +1557,51 @@ def _settings_keyboard(
                 InlineKeyboardButton(reaction_label, callback_data="menu|toggle_group_reaction"),
                 InlineKeyboardButton(chat_mode_label, callback_data="menu|toggle_group_chat_mode"),
             ],
+            [InlineKeyboardButton(public_chat_label, callback_data="menu|toggle_public_private_chat_mode")],
             [InlineKeyboardButton(group_activity_label, callback_data="menu|toggle_group_activity")],
+            [
+                InlineKeyboardButton(social_mode_label, callback_data="menu|toggle_social_mode"),
+                InlineKeyboardButton(f"👤 Рейтинг людей ({relations_count})", callback_data="menu|relations"),
+            ],
+            [InlineKeyboardButton(f"🗯 Подколы/обзывалки ({roast_words_count})", callback_data="menu|roast")],
             [
                 InlineKeyboardButton("📥 Импорт стиля общения", callback_data="menu|import_style_examples"),
                 InlineKeyboardButton(f"🧹 Очистить стиль ({style_examples_count})", callback_data="menu|clear_style_examples"),
             ],
             [InlineKeyboardButton(f"🚫 Черный список ({blacklist_count})", callback_data="menu|blacklist")],
+            [InlineKeyboardButton("📤 Экспорт переписок", callback_data="menu|export_chats")],
             [InlineKeyboardButton("📌 Сделать этот чат группой", callback_data="menu|set_group_here")],
             [InlineKeyboardButton("⭐ Премиум и эмодзи", callback_data="menu|premium")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="menu|home")],
         ]
+    )
+
+
+def _settings_markup_for_chat(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    mode: str,
+    person_name: str,
+) -> InlineKeyboardMarkup:
+    state = _get_state(context)
+    relation_chat_id = _effective_group_chat_id(context) or chat_id
+    relations_count = len(state.list_chat_relations(chat_id=relation_chat_id, limit=9999))
+    return _settings_keyboard(
+        mode=mode,
+        person_name=person_name,
+        schedule_mode=state.get_schedule_mode(),
+        admin_only_mode=state.is_admin_only_mode(),
+        exceptions_count=len(state.list_access_exceptions()),
+        blacklist_count=len(state.get_blacklist_phrases()),
+        group_reaction_mode=state.is_group_fire_reaction_mode(),
+        group_chat_mode=state.is_group_chat_mode(),
+        public_private_chat_mode=state.is_public_private_chat_mode(),
+        group_activity_mode=state.get_group_activity_mode(),
+        style_examples_count=len(state.get_style_examples()),
+        social_mode=state.get_social_mode(),
+        roast_words_count=len(state.get_roast_words()),
+        relations_count=relations_count,
     )
 
 
@@ -956,6 +1639,63 @@ def _blacklist_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("👀 Показать фразы", callback_data="menu|blacklist_show")],
             [InlineKeyboardButton("🧹 Очистить черный список", callback_data="menu|blacklist_reset")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="menu|settings")],
+        ]
+    )
+
+
+def _roast_keyboard(state: BotStateStore) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"👀 Показать список ({len(state.get_roast_words())})", callback_data="menu|roast_show")],
+            [InlineKeyboardButton("➕ Добавить слова", callback_data="menu|roast_add")],
+            [InlineKeyboardButton("♻️ Сбросить к базовым", callback_data="menu|roast_reset")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu|settings")],
+        ]
+    )
+
+
+def _relations_keyboard(*, state: BotStateStore, relation_chat_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for rel in state.list_chat_relations(chat_id=relation_chat_id, limit=30):
+        user_id = int(rel.get("user_id", 0))
+        if not user_id:
+            continue
+        name = _relation_display_name(rel)
+        score = int(rel.get("score", 0))
+        status = _relation_status_ru(str(rel.get("status", "neutral")))
+        label = f"{name} | {score:+d} ({status})"
+        if len(label) > 58:
+            label = f"{label[:55]}..."
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"menu|rel_user|{relation_chat_id}|{user_id}",
+                )
+            ]
+        )
+    if not rows:
+        rows.append([InlineKeyboardButton("Пока нет данных", callback_data="menu|noop")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _relation_adjust_keyboard(*, relation_chat_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➖25", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|-25"),
+                InlineKeyboardButton("➖10", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|-10"),
+                InlineKeyboardButton("➖5", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|-5"),
+            ],
+            [
+                InlineKeyboardButton("➕5", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|5"),
+                InlineKeyboardButton("➕10", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|10"),
+                InlineKeyboardButton("➕25", callback_data=f"menu|rel_adj|{relation_chat_id}|{user_id}|25"),
+            ],
+            [InlineKeyboardButton("↩️ Сбросить в 0", callback_data=f"menu|rel_set|{relation_chat_id}|{user_id}|0")],
+            [InlineKeyboardButton("✍️ Ввести рейтинг вручную", callback_data=f"menu|rel_prompt|{relation_chat_id}|{user_id}")],
+            [InlineKeyboardButton("⬅️ К списку людей", callback_data=f"menu|relations|{relation_chat_id}")],
         ]
     )
 
@@ -1433,6 +2173,16 @@ async def _send_wish(
     if not sent_message_id:
         logging.warning("Cannot resolve message_id for generation snapshot chat_id=%s", chat_id)
         return
+    _log_outgoing_message(
+        context=context,
+        chat_id=chat_id,
+        chat_type="group" if int(chat_id) < 0 else "private",
+        message_id=sent_message_id,
+        text=sent_text,
+        source=f"wish_{source}",
+        reply_to_message_id=0,
+        peer_user_id=0,
+    )
     if training_mode_enabled and source in {"training_stream", "inline_regenerate", "feedback_bad_text", "inline_person_switch"}:
         _set_training_waiting(context, chat_id=chat_id, waiting=True, message_id=sent_message_id)
     _store_generation_snapshot(
@@ -1572,8 +2322,13 @@ async def _show_settings(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     blacklist_count = len(state.get_blacklist_phrases())
     group_reaction_mode = state.is_group_fire_reaction_mode()
     group_chat_mode = state.is_group_chat_mode()
+    public_private_chat_mode = state.is_public_private_chat_mode()
     group_activity_mode = state.get_group_activity_mode()
     style_examples_count = len(state.get_style_examples())
+    social_mode = state.get_social_mode()
+    roast_words_count = len(state.get_roast_words())
+    relations_count = len(state.list_chat_relations(chat_id=group_id or chat_id, limit=9999))
+    log_rows_count, log_users_count = _chat_log_quick_stats(context)
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
@@ -1591,23 +2346,23 @@ async def _show_settings(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
             f"- фраз в черном списке: {blacklist_count}\n"
             f"- 🔥 реакции на voice/video в группе: {_on_off_ru(group_reaction_mode)}\n"
             f"- 💬 режим общения в группе: {_on_off_ru(group_chat_mode)}\n"
+            f"- 🗨 личный чат для всех: {_on_off_ru(public_private_chat_mode)}\n"
             f"- 🎚 активность ответов: {_group_activity_ru(group_activity_mode)}\n"
+            f"- 🧠 социальный режим: {_social_mode_ru(social_mode)}\n"
+            f"- 🗯 дружеских подколов: {roast_words_count}\n"
+            f"- 👤 людей в рейтинге: {relations_count}\n"
             f"- примеров стиля из экспорта: {style_examples_count}\n"
+            f"- записей в логе переписки: {log_rows_count}\n"
+            f"- пользователей в логе: {log_users_count}\n"
             f"- GPT генерация: {'ВКЛ' if config.openai_enabled else 'ВЫКЛ'}\n"
             f"- GPT модель: {config.openai_model}\n"
             f"- GPT endpoint: {config.openai_base_url}"
         ),
-        reply_markup=_settings_keyboard(
-            mode,
-            person.get("name", "общий вариант"),
-            schedule_mode,
-            admin_only_mode,
-            exceptions_count,
-            blacklist_count,
-            group_reaction_mode,
-            group_chat_mode,
-            group_activity_mode,
-            style_examples_count,
+        reply_markup=_settings_markup_for_chat(
+            context=context,
+            chat_id=chat_id,
+            mode=mode,
+            person_name=person.get("name", "общий вариант"),
         ),
     )
 
@@ -1633,8 +2388,13 @@ async def _send_modes_help(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) 
         "Группа:\n"
         "- «🔥 Реакции на voice/video» — бот ставит огонек на голосовые и видео.\n"
         "- «💬 Общение в группе» — бот периодически отвечает в беседе.\n"
+        "- «🗨 Личка для всех» — неадмины могут просто болтать с ботом в личке.\n"
         "- «🎚 Активность» — тихо / норм / каждое сообщение / только вопрос.\n"
-        "- «📥 Импорт стиля общения» — загрузи JSON/TXT экспорт, чтобы бот писал ближе к твоему стилю."
+        "- «📥 Импорт стиля общения» — загрузи JSON/TXT/HTML экспорт, чтобы бот писал ближе к твоему стилю.\n"
+        "- «🧠 Соц режим»:\n"
+        "  самообучение — учитывает рейтинг человека и прошлое общение,\n"
+        "  как я — сильнее копирует твой стиль по экспорту.\n"
+        "- «🗯 Подколы/обзывалки» — список слов для дружеского стеба."
     )
     await context.bot.send_message(chat_id=chat_id, text=text)
 
@@ -1663,8 +2423,14 @@ async def _send_stats(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
     blacklist_count = len(state.get_blacklist_phrases())
     group_reaction_mode = state.is_group_fire_reaction_mode()
     group_chat_mode = state.is_group_chat_mode()
+    public_private_chat_mode = state.is_public_private_chat_mode()
     group_activity_mode = state.get_group_activity_mode()
     style_examples_count = len(state.get_style_examples())
+    social_mode = state.get_social_mode()
+    roast_words_count = len(state.get_roast_words())
+    relation_chat_id = group_id or chat_id
+    relations = state.list_chat_relations(chat_id=relation_chat_id, limit=500)
+    log_rows_count, log_users_count = _chat_log_quick_stats(context)
     recent_generations = store.recent_generations(limit=4000)
     openai_generated = 0
     local_generated = 0
@@ -1687,6 +2453,17 @@ async def _send_stats(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
             return "нет данных"
         pairs = sorted(bucket.items(), key=lambda x: x[1], reverse=True)
         return ", ".join(f"{name}: {count}" for name, count in pairs[:5])
+
+    def _top_relations_lines() -> str:
+        if not relations:
+            return "нет данных"
+        lines: list[str] = []
+        for row in relations[:10]:
+            score = int(row.get("score", 0))
+            status = _relation_status_ru(str(row.get("status", "neutral")))
+            name = _relation_display_name(row)
+            lines.append(f"{name}: {score:+d} ({status})")
+        return "\n".join(lines)
 
     text = (
         "Статистика:\n"
@@ -1717,14 +2494,23 @@ async def _send_stats(*, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> No
         f"- фраз в черном списке: {blacklist_count}\n"
         f"- 🔥 реакции на voice/video: {_on_off_ru(group_reaction_mode)}\n"
         f"- 💬 режим общения в группе: {_on_off_ru(group_chat_mode)}\n"
+        f"- 🗨 личный чат для всех: {_on_off_ru(public_private_chat_mode)}\n"
         f"- 🎚 активность ответов: {_group_activity_ru(group_activity_mode)}\n"
+        f"- 🧠 социальный режим: {_social_mode_ru(social_mode)}\n"
+        f"- 🗯 подколов/обзывалок: {roast_words_count}\n"
         f"- примеров стиля из экспорта: {style_examples_count}\n"
+        f"- записей в логе переписки: {log_rows_count}\n"
+        f"- пользователей в логе: {log_users_count}\n"
         f"- режим «только админ»: {_on_off_ru(admin_only_mode)}\n"
         f"- пользователей в исключениях: {exceptions_count}\n"
         f"- текущий ID админа: {admin_id or 'не задан'}\n"
         f"- текущий ID группы: {group_id or 'не задан'}\n"
         f"- GPT генерация: {_on_off_ru(config.openai_enabled)}\n"
-        f"- GPT модель: {config.openai_model}"
+        f"- GPT модель: {config.openai_model}\n"
+        "\nРейтинг контактов:\n"
+        f"- чат рейтинга: {relation_chat_id}\n"
+        f"- людей в базе: {len(relations)}\n"
+        f"{_top_relations_lines()}"
     )
     await context.bot.send_message(chat_id=chat_id, text=text)
 
@@ -1774,8 +2560,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"- GPT генерация: {_on_off_ru(config.openai_enabled)}\n"
         f"- GPT модель: {config.openai_model}"
     )
+    if _is_public_private_chat_user(update, context):
+        await update.effective_message.reply_text(
+            "Привет. Можем общаться в обычном режиме.\n"
+            "Я запоминаю контекст и стиль диалога."
+        )
+        return
     await update.effective_message.reply_text(text)
     await _show_home(update, context)
+
+
+async def audit_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message:
+        return
+    _log_incoming_message(update, context)
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1876,6 +2675,55 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
+        if action == "roast_add":
+            if not await _ensure_admin(update, context):
+                return
+            raw_parts = re.split(r"[,;\n]+", text)
+            words = [" ".join(part.split()) for part in raw_parts if " ".join(part.split())]
+            if not words:
+                _set_pending_input(context, chat_id=chat.id, user_id=user.id, action="roast_add")
+                await message.reply_text("Пришли 1+ слова/фразы через запятую или с новой строки.")
+                return
+            added = state.add_roast_words(words)
+            await message.reply_text(
+                f"Добавил слов: {added}. Всего в списке: {len(state.get_roast_words())}.",
+                reply_markup=_roast_keyboard(state),
+            )
+            return
+
+        if action == "set_relation_score":
+            if not await _ensure_admin(update, context):
+                return
+            relation_chat_id = int(pending.get("relation_chat_id", 0) or 0)
+            target_user_id = int(pending.get("target_user_id", 0) or 0)
+            if not relation_chat_id or not target_user_id:
+                await message.reply_text("Не смог понять кого обновлять. Открой карточку заново.")
+                return
+            numbers = re.findall(r"-?\d+", text)
+            if not numbers:
+                _set_pending_input(
+                    context,
+                    chat_id=chat.id,
+                    user_id=user.id,
+                    action="set_relation_score",
+                    payload={"relation_chat_id": relation_chat_id, "target_user_id": target_user_id},
+                )
+                await message.reply_text("Нужен числовой рейтинг от -100 до 100. Пример: 35 | за активную помощь")
+                return
+            score = _safe_relation_score(context, target_user_id, int(numbers[0]))
+            reason = text
+            relation = state.set_relation_score(
+                chat_id=relation_chat_id,
+                user_id=target_user_id,
+                score=score,
+                reason=reason or "админ вручную",
+            )
+            await message.reply_text(
+                f"Рейтинг обновлен: {_relation_display_name(relation)} -> {int(relation.get('score', 0)):+d} "
+                f"({_relation_status_ru(str(relation.get('status', 'neutral')))})"
+            )
+            return
+
         if action == "set_premium_ids":
             await message.reply_text(
                 "Ручной ввод ID отключен.\n"
@@ -1967,6 +2815,100 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _set_training_waiting(context, chat_id=chat.id, waiting=False)
             await _send_wish(chat_id=chat.id, kind=kind, context=context, source="feedback_bad_text")
             return
+
+    if _is_public_private_chat_user(update, context):
+        state = _get_state(context)
+        incoming_text = text or _message_text_or_caption(message) or "[без текста]"
+        user_name = str(getattr(user, "first_name", "") or getattr(user, "username", "") or "").strip()
+        _append_group_dialogue(context, chat_id=chat.id, line=f"{user_name or 'Пользователь'}: {incoming_text}")
+
+        relation = state.get_or_create_relation(
+            chat_id=chat.id,
+            user_id=user.id,
+            first_name=str(getattr(user, "first_name", "") or ""),
+            last_name=str(getattr(user, "last_name", "") or ""),
+            username=str(getattr(user, "username", "") or ""),
+        )
+        relation = _ensure_admin_relation_floor(
+            context=context,
+            state=state,
+            chat_id=chat.id,
+            user_id=user.id,
+        ) or relation
+
+        delta, reason = _relation_signal(incoming_text)
+        safe_delta = _safe_relation_delta(context, user.id, delta)
+        if safe_delta:
+            relation = state.adjust_relation_score(
+                chat_id=chat.id,
+                user_id=user.id,
+                delta=safe_delta,
+                reason=reason or "личный чат",
+                text=incoming_text,
+                first_name=str(getattr(user, "first_name", "") or ""),
+                last_name=str(getattr(user, "last_name", "") or ""),
+                username=str(getattr(user, "username", "") or ""),
+            )
+            relation = _ensure_admin_relation_floor(
+                context=context,
+                state=state,
+                chat_id=chat.id,
+                user_id=user.id,
+            ) or relation
+
+        if _is_forgive_request(incoming_text):
+            reply_text = _forgive_reply_for_relation(relation=relation, user_name="")
+            sent = await message.reply_text(reply_text)
+            _append_group_dialogue(context, chat_id=chat.id, line=f"Бот: {reply_text}")
+            _log_outgoing_message(
+                context=context,
+                chat_id=chat.id,
+                chat_type="private",
+                message_id=int(getattr(sent, "message_id", 0) or 0),
+                text=reply_text,
+                source="private_forgive_reply",
+                reply_to_message_id=message.message_id,
+                peer_user_id=user.id,
+            )
+            return
+
+        reply_text, source = await _generate_private_chat_reply(
+            context=context,
+            chat_id=chat.id,
+            incoming_text=incoming_text,
+            user_name=user_name,
+            relation=relation,
+        )
+        sent = await message.reply_text(reply_text)
+        _append_group_dialogue(context, chat_id=chat.id, line=f"Бот: {reply_text}")
+        _log_outgoing_message(
+            context=context,
+            chat_id=chat.id,
+            chat_type="private",
+            message_id=int(getattr(sent, "message_id", 0) or 0),
+            text=reply_text,
+            source=f"private_chat_{source}",
+            reply_to_message_id=message.message_id,
+            peer_user_id=user.id,
+        )
+        return
+
+    query_text = _extract_v_query(text)
+    if query_text:
+        answer = await _answer_v_query(query_text)
+        sent = await message.reply_text(answer)
+        _log_outgoing_message(
+            context=context,
+            chat_id=chat.id,
+            chat_type="private",
+            message_id=int(getattr(sent, "message_id", 0) or 0),
+            text=answer,
+            source="private_v_query",
+            reply_to_message_id=message.message_id,
+            peer_user_id=user.id,
+        )
+        return
+
     state = _get_state(context)
     unicode_emojis = _extract_unicode_emojis(text)
     custom_emoji_ids = _extract_custom_emoji_ids(message)
@@ -2087,6 +3029,95 @@ async def _set_wish_heart_reaction(
     )
 
 
+async def _set_social_relation_reaction(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delta: int,
+) -> None:
+    pool = SOCIAL_WARM_REACTIONS if int(delta) > 0 else SOCIAL_COLD_REACTIONS
+    emoji = random.choice(pool)
+    await _set_message_reaction(
+        context=context,
+        chat_id=chat_id,
+        message_id=message_id,
+        reaction=[{"type": "emoji", "emoji": emoji}],
+        is_big=False,
+    )
+
+
+def _pick_contextual_reaction_emoji(
+    *,
+    text: str,
+    relation_score: int,
+    delta: int,
+) -> str | None:
+    plain = _plain_text_for_blacklist(text)
+    if not plain:
+        return None
+
+    if any(marker in plain for marker in THANKS_MARKERS):
+        return random.choice(("❤️", "🫶", "👏", "✨"))
+    if any(marker in plain for marker in LAUGH_MARKERS):
+        return random.choice(GROUP_CONTEXT_FUN_REACTIONS)
+    if _looks_like_question(text):
+        return random.choice(("🤔", "🧠", "👀"))
+
+    if int(delta) <= -8 or int(relation_score) <= -45:
+        return random.choice(GROUP_CONTEXT_NEGATIVE_REACTIONS)
+    if int(delta) >= 4 or int(relation_score) >= 24:
+        return random.choice(GROUP_CONTEXT_POSITIVE_REACTIONS)
+    return random.choice(GROUP_CONTEXT_NEUTRAL_REACTIONS)
+
+
+async def _maybe_set_contextual_group_reaction(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    relation_score: int,
+    delta: int,
+    is_wish_text: bool,
+) -> None:
+    if is_wish_text:
+        return
+
+    plain = _plain_text_for_blacklist(text)
+    if not plain:
+        return
+
+    base_chance = 0.12
+    if _looks_like_question(text):
+        base_chance += 0.14
+    if abs(int(delta)) >= 8:
+        base_chance += 0.28
+    if int(relation_score) <= -45 or int(relation_score) >= 30:
+        base_chance += 0.18
+    if any(marker in plain for marker in THANKS_MARKERS):
+        base_chance += 0.15
+    if any(marker in plain for marker in LAUGH_MARKERS):
+        base_chance += 0.15
+    if random.random() > min(0.88, base_chance):
+        return
+
+    emoji = _pick_contextual_reaction_emoji(
+        text=text,
+        relation_score=relation_score,
+        delta=delta,
+    )
+    if not emoji:
+        return
+    await _set_message_reaction(
+        context=context,
+        chat_id=chat_id,
+        message_id=message_id,
+        reaction=[{"type": "emoji", "emoji": emoji}],
+        is_big=False,
+    )
+
+
 def _is_group_voice_or_video(message: object) -> bool:
     return bool(
         getattr(message, "voice", None)
@@ -2164,6 +3195,7 @@ def _should_reply_in_group(
     message: object,
     text: str,
     activity_mode: str,
+    relation_score: int = 0,
 ) -> bool:
     mode = str(activity_mode or "").strip().lower()
     if mode == "active":
@@ -2171,32 +3203,98 @@ def _should_reply_in_group(
     if mode == "question_only":
         return _looks_like_question(text)
 
+    if int(relation_score) <= HOSTILE_FORCE_REPLY_SCORE and random.random() < HOSTILE_SILENCE_BREAK_CHANCE:
+        return True
+
     if _is_direct_group_addressing(context=context, message=message, text=text):
         return True
 
     chance = 0.10 if mode == "quiet" else GROUP_CHAT_REPLY_CHANCE
     if _looks_like_question(text):
         chance += 0.20
+    if int(relation_score) <= -45:
+        chance += 0.35
     return random.random() < min(1.0, chance)
 
 
-def _local_group_reply(*, incoming_text: str, user_name: str) -> str:
-    question_replies = [
-        "Сложный вопрос, но звучит интересно.",
-        "Я бы попробовал так, как тебе сейчас спокойнее.",
-        "Нормальный вопрос, давай разберем по шагам.",
-        "Я бы пошел через самый простой вариант.",
-    ]
-    plain_replies = [
-        "Да, понимаю тебя.",
-        "Звучит хорошо, мне нравится ход мысли.",
-        "Поддерживаю, нормальная идея.",
-        "Окей, принято.",
-        "Хорошо сказано.",
-        "Согласен, это важно.",
-    ]
-    pool = question_replies if "?" in incoming_text else plain_replies
+def _local_group_reply(
+    *,
+    incoming_text: str,
+    user_name: str,
+    relation: dict | None,
+    social_mode: str,
+    roast_words: list[str],
+    force_hostile: bool = False,
+) -> str:
+    relation = relation or {}
+    score = int(relation.get("score", 0))
+    status = str(relation.get("status", "neutral")).strip().lower()
+    question = _looks_like_question(incoming_text)
     prefix = f"{user_name}, " if user_name else ""
+
+    question_replies = [
+        "вопрос хороший, давай разложим по шагам.",
+        "я бы пошел от простого варианта и проверил на практике.",
+        "сначала собери факты, потом решим без суеты.",
+        "давай глянем контекст, тогда ответ будет точнее.",
+    ]
+    neutral_replies = [
+        "понял тебя.",
+        "принял, звучит логично.",
+        "нормальная мысль, поддерживаю.",
+        "окей, зафиксировал.",
+        "согласен, это важно.",
+    ]
+    warm_replies = [
+        "ты красавчик, хороший ход мысли.",
+        "мне нравится, как ты это сформулировал.",
+        "очень по делу, давай так и сделаем.",
+        "круто сказал, я с тобой.",
+    ]
+    cold_replies = [
+        "тон мерзкий. сбавь обороты.",
+        "сначала научись говорить по-человечески.",
+        "звучит как наезд. переделай формулировку.",
+        "ты вечно с претензией. надоело.",
+    ]
+    hostile_replies = [
+        "опять поток отмазок. звучишь жалко.",
+        "твой тон нулевой, аргументов тоже не вижу.",
+        "ты уже глубоко в минусе по доверию.",
+        "с таким поведением нормального диалога не будет.",
+        "прежде чем писать, включи голову и уважение.",
+        "каждый твой наезд просто сливает разговор в мусор.",
+    ]
+    hostile_forced_replies = [
+        "ахах, снова ты с этим шумом. скучно и слабо.",
+        "очередной вброс ни о чем. стабильность уровня дна.",
+        "не удивил. как всегда мимо и с претензией.",
+        "вместо драмы попробуй говорить по делу.",
+        "с тобой каждый раз один и тот же кринж.",
+    ]
+
+    if social_mode == "style_clone":
+        if question:
+            pool = question_replies
+        else:
+            pool = warm_replies if score >= 20 else neutral_replies
+        return f"{prefix}{random.choice(pool)}"
+
+    is_hostile = force_hostile or status == "hostile" or score <= -45
+    if is_hostile:
+        pool = hostile_replies
+        if score <= HOSTILE_FORCE_REPLY_SCORE:
+            pool = hostile_forced_replies + hostile_replies
+        if roast_words and random.random() < 0.52:
+            roast = random.choice(roast_words)
+            pool.append(f"{roast}. тон прежний: токсичный и пустой.")
+    elif status == "cold" or score <= -18:
+        pool = cold_replies
+    elif status in {"friendly", "warm"} or score >= 12:
+        pool = question_replies if question else warm_replies
+    else:
+        pool = question_replies if question else neutral_replies
+
     return f"{prefix}{random.choice(pool)}"
 
 
@@ -2206,21 +3304,30 @@ async def _generate_group_chat_reply(
     chat_id: int,
     incoming_text: str,
     user_name: str,
+    relation: dict | None,
+    social_mode: str,
+    force_hostile: bool = False,
 ) -> tuple[str, str]:
     state = _get_state(context)
     config = _get_config(context)
     recent_dialogue = _recent_group_dialogue(context, chat_id=chat_id, limit=14)
     style_examples = state.get_style_examples()
     blacklist = state.get_blacklist_phrases()
+    relation_summary = _relation_summary_for_prompt(relation)
+    roast_words = state.get_roast_words()
+    prefer_local_hostile = bool(force_hostile and social_mode == "self_learning")
 
-    if config.openai_enabled:
+    if config.openai_enabled and not prefer_local_hostile:
         try:
             text = await generate_openai_chat_reply(
                 cfg=_openai_runtime_cfg(config),
                 incoming_text=incoming_text,
                 recent_dialogue=recent_dialogue,
                 style_examples=style_examples,
-                bot_name=_chat_name_or_title(getattr(context, "bot", None)),
+                bot_name=str(getattr(context.bot, "first_name", "") or getattr(context.bot, "username", "") or "бот"),
+                social_mode=social_mode,
+                relation_summary=relation_summary,
+                roast_words=roast_words,
             )
             clean = " ".join(str(text).split())
             if clean:
@@ -2235,10 +3342,44 @@ async def _generate_group_chat_reply(
         except Exception as exc:
             logging.exception("Unexpected group chat LLM error: %s", exc)
 
-    fallback = _local_group_reply(incoming_text=incoming_text, user_name=user_name)
+    fallback = _local_group_reply(
+        incoming_text=incoming_text,
+        user_name=user_name,
+        relation=relation,
+        social_mode=social_mode,
+        roast_words=roast_words,
+        force_hostile=force_hostile,
+    )
     if _contains_blacklisted_phrase(fallback, blacklist):
         fallback = "Понял тебя."
     return fallback, "local"
+
+
+async def _generate_private_chat_reply(
+    *,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    incoming_text: str,
+    user_name: str,
+    relation: dict | None,
+) -> tuple[str, str]:
+    state = _get_state(context)
+    social_mode = state.get_social_mode()
+    score = int((relation or {}).get("score", 0))
+    force_hostile = (
+        social_mode == "self_learning"
+        and score <= HOSTILE_FORCE_REPLY_SCORE
+        and random.random() < 0.72
+    )
+    return await _generate_group_chat_reply(
+        context=context,
+        chat_id=chat_id,
+        incoming_text=incoming_text,
+        user_name=user_name,
+        relation=relation,
+        social_mode=social_mode,
+        force_hostile=force_hostile,
+    )
 
 
 async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2261,33 +3402,159 @@ async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not text:
         return
 
-    if _is_wish_like_text(text):
+    is_wish_text = _is_wish_like_text(text)
+    if is_wish_text:
         await _set_wish_heart_reaction(context=context, chat_id=chat.id, message_id=message.message_id)
 
     user_name = str(getattr(user, "first_name", "") or getattr(user, "username", "") or "").strip()
     _append_group_dialogue(context, chat_id=chat.id, line=f"{user_name or 'Участник'}: {text}")
 
+    relation = state.get_or_create_relation(
+        chat_id=chat.id,
+        user_id=user.id,
+        first_name=str(getattr(user, "first_name", "") or ""),
+        last_name=str(getattr(user, "last_name", "") or ""),
+        username=str(getattr(user, "username", "") or ""),
+    )
+    relation = _ensure_admin_relation_floor(
+        context=context,
+        state=state,
+        chat_id=chat.id,
+        user_id=user.id,
+    ) or relation
+    delta, reason = _relation_signal(text)
+    reaction_done = False
+    safe_delta = _safe_relation_delta(context, user.id, delta)
+    if safe_delta:
+        relation = state.adjust_relation_score(
+            chat_id=chat.id,
+            user_id=user.id,
+            delta=safe_delta,
+            reason=reason or "сигнал общения",
+            text=text,
+            first_name=str(getattr(user, "first_name", "") or ""),
+            last_name=str(getattr(user, "last_name", "") or ""),
+            username=str(getattr(user, "username", "") or ""),
+        )
+        relation = _ensure_admin_relation_floor(
+            context=context,
+            state=state,
+            chat_id=chat.id,
+            user_id=user.id,
+        ) or relation
+        if not is_wish_text and abs(safe_delta) >= 8 and random.random() < 0.45:
+            await _set_social_relation_reaction(
+                context=context,
+                chat_id=chat.id,
+                message_id=message.message_id,
+                delta=safe_delta,
+            )
+            reaction_done = True
+
+    relation_score = int(relation.get("score", 0))
+    if not reaction_done:
+        await _maybe_set_contextual_group_reaction(
+            context=context,
+            chat_id=chat.id,
+            message_id=message.message_id,
+            text=text,
+            relation_score=relation_score,
+            delta=safe_delta,
+            is_wish_text=is_wish_text,
+        )
+
+    v_query = _extract_v_query(text)
+    if v_query:
+        answer = await _answer_v_query(v_query)
+        kwargs = {
+            "chat_id": chat.id,
+            "text": answer,
+            "reply_to_message_id": message.message_id,
+        }
+        thread_id = getattr(message, "message_thread_id", None)
+        if isinstance(thread_id, int):
+            kwargs["message_thread_id"] = thread_id
+        sent = await context.bot.send_message(**kwargs)
+        _append_group_dialogue(context, chat_id=chat.id, line=f"Бот: {answer}")
+        _mark_group_reply_now(context, chat_id=chat.id)
+        _log_outgoing_message(
+            context=context,
+            chat_id=chat.id,
+            chat_type=str(chat.type),
+            message_id=int(getattr(sent, "message_id", 0) or 0),
+            text=answer,
+            source="group_v_query",
+            reply_to_message_id=message.message_id,
+            peer_user_id=user.id,
+        )
+        logging.info("Group @v reply chat_id=%s message_id=%s", chat.id, sent.message_id)
+        return
+
     if not state.is_group_chat_mode():
         return
 
     wish_kind = _detect_group_wish_kind(text)
+    social_mode = state.get_social_mode()
 
     activity_mode = state.get_group_activity_mode()
-    if wish_kind:
+    if _is_forgive_request(text):
+        reply_text = _forgive_reply_for_relation(relation=relation, user_name=user_name)
+        if int(relation.get("score", 0)) < -18 or bool(relation.get("forgive_blocked", False)):
+            adj = _safe_relation_delta(context, user.id, -1)
+            state.adjust_relation_score(
+                chat_id=chat.id,
+                user_id=user.id,
+                delta=adj,
+                reason="просьба о прощении при негативном фоне",
+                text=text,
+                first_name=str(getattr(user, "first_name", "") or ""),
+                last_name=str(getattr(user, "last_name", "") or ""),
+                username=str(getattr(user, "username", "") or ""),
+            )
+        else:
+            adj = _safe_relation_delta(context, user.id, 3)
+            state.adjust_relation_score(
+                chat_id=chat.id,
+                user_id=user.id,
+                delta=adj,
+                reason="позитивная просьба о прощении",
+                text=text,
+                first_name=str(getattr(user, "first_name", "") or ""),
+                last_name=str(getattr(user, "last_name", "") or ""),
+                username=str(getattr(user, "username", "") or ""),
+            )
+        reply_source = "social_forgive"
+    elif wish_kind:
         reply_text = _group_special_wish_reply(kind=wish_kind, user_name=user_name)
         reply_source = f"special_{wish_kind}"
     else:
-        cooldown_sec = _group_reply_cooldown_for_mode(activity_mode)
+        force_hostile = (
+            social_mode == "self_learning"
+            and relation_score <= HOSTILE_FORCE_REPLY_SCORE
+            and random.random() < 0.72
+        )
+        cooldown_sec = 0.0 if (force_hostile and activity_mode != "quiet") else _group_reply_cooldown_for_mode(activity_mode)
         if cooldown_sec > 0 and not _is_group_reply_cooldown_ready(context, chat_id=chat.id, cooldown_sec=cooldown_sec):
             return
-        if not _should_reply_in_group(context=context, message=message, text=text, activity_mode=activity_mode):
+        if not _should_reply_in_group(
+            context=context,
+            message=message,
+            text=text,
+            activity_mode=activity_mode,
+            relation_score=relation_score,
+        ):
             return
         reply_text, reply_source = await _generate_group_chat_reply(
             context=context,
             chat_id=chat.id,
             incoming_text=text,
             user_name=user_name,
+            relation=relation,
+            social_mode=social_mode,
+            force_hostile=force_hostile,
         )
+        if force_hostile:
+            reply_source = f"{reply_source}_forced"
     if not reply_text:
         return
 
@@ -2302,7 +3569,23 @@ async def group_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     sent = await context.bot.send_message(**kwargs)
     _append_group_dialogue(context, chat_id=chat.id, line=f"Бот: {reply_text}")
     _mark_group_reply_now(context, chat_id=chat.id)
-    logging.info("Group chat reply source=%s chat_id=%s message_id=%s", reply_source, chat.id, sent.message_id)
+    _log_outgoing_message(
+        context=context,
+        chat_id=chat.id,
+        chat_type=str(chat.type),
+        message_id=int(getattr(sent, "message_id", 0) or 0),
+        text=reply_text,
+        source=f"group_reply_{reply_source}",
+        reply_to_message_id=message.message_id,
+        peer_user_id=user.id,
+    )
+    logging.info(
+        "Group chat reply source=%s social_mode=%s chat_id=%s message_id=%s",
+        reply_source,
+        social_mode,
+        chat.id,
+        sent.message_id,
+    )
 
 
 async def media_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2353,14 +3636,14 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     document = getattr(message, "document", None)
     if not document:
         _set_pending_input(context, chat_id=chat.id, user_id=user.id, action="import_style_examples")
-        await message.reply_text("Файл не найден. Отправь JSON/TXT экспортом.")
+        await message.reply_text("Файл не найден. Отправь JSON/TXT/HTML экспортом.")
         return
 
     file_name = str(getattr(document, "file_name", "") or "").strip()
     ext = os.path.splitext(file_name.lower())[1]
-    if ext not in {".json", ".txt"}:
+    if ext not in {".json", ".txt", ".html", ".htm"}:
         _set_pending_input(context, chat_id=chat.id, user_id=user.id, action="import_style_examples")
-        await message.reply_text("Поддерживаю только JSON или TXT.")
+        await message.reply_text("Поддерживаю JSON, TXT и HTML (экспорт Telegram).")
         return
 
     tmp_path = os.path.join(
@@ -2380,10 +3663,29 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 raise ValueError("Некорректный JSON")
             admin_id = _effective_admin_user_id(context)
             examples = _extract_style_examples_from_export_json(payload, admin_id)
-        else:
+        elif ext == ".txt":
             with open(tmp_path, "r", encoding="utf-8", errors="ignore") as handle:
                 raw_text = handle.read()
             examples = _extract_style_examples_from_text(raw_text)
+        else:
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as handle:
+                raw_html = handle.read()
+            author_hints = [
+                str(getattr(user, "first_name", "") or "").strip(),
+                str(getattr(user, "last_name", "") or "").strip(),
+                str(getattr(user, "username", "") or "").strip(),
+            ]
+            full_name = " ".join(
+                part
+                for part in (
+                    str(getattr(user, "first_name", "") or "").strip(),
+                    str(getattr(user, "last_name", "") or "").strip(),
+                )
+                if part
+            )
+            if full_name:
+                author_hints.append(full_name)
+            examples = _extract_style_examples_from_export_html(raw_html, author_hints=author_hints)
 
         if not examples:
             _set_pending_input(context, chat_id=chat.id, user_id=user.id, action="import_style_examples")
@@ -2401,7 +3703,7 @@ async def document_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as exc:
         logging.exception("Style import failed: %s", exc)
         _set_pending_input(context, chat_id=chat.id, user_id=user.id, action="import_style_examples")
-        await message.reply_text("Не смог прочитать файл. Попробуй другой JSON/TXT.")
+        await message.reply_text("Не смог прочитать файл. Попробуй другой JSON/TXT/HTML.")
     finally:
         try:
             if os.path.exists(tmp_path):
@@ -2606,22 +3908,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             new_mode = state.toggle_chat_mode(chat_id)
             _, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"Режим: {_mode_ru(new_mode)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        new_mode,
-                        person.get("name", "общий вариант"),
-                        state.get_schedule_mode(),
-                        state.is_admin_only_mode(),
-                        exceptions_count,
-                        blacklist_count,
-                        state.is_group_fire_reaction_mode(),
-                        state.is_group_chat_mode(),
-                        state.get_group_activity_mode(),
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=new_mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
@@ -2632,22 +3926,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             new_schedule_mode = state.toggle_schedule_mode()
             mode, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"Режим рассылки: {_mode_ru(new_schedule_mode)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        mode,
-                        person.get("name", "общий вариант"),
-                        new_schedule_mode,
-                        state.is_admin_only_mode(),
-                        exceptions_count,
-                        blacklist_count,
-                        state.is_group_fire_reaction_mode(),
-                        state.is_group_chat_mode(),
-                        state.get_group_activity_mode(),
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
@@ -2658,22 +3944,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             enabled = state.toggle_admin_only_mode()
             mode, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"Только админ: {_on_off_ru(enabled)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        mode,
-                        person.get("name", "общий вариант"),
-                        state.get_schedule_mode(),
-                        enabled,
-                        exceptions_count,
-                        blacklist_count,
-                        state.is_group_fire_reaction_mode(),
-                        state.is_group_chat_mode(),
-                        state.get_group_activity_mode(),
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
@@ -2684,22 +3962,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             enabled = state.toggle_group_fire_reaction_mode()
             mode, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"🔥 Реакции: {_on_off_ru(enabled)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        mode,
-                        person.get("name", "общий вариант"),
-                        state.get_schedule_mode(),
-                        state.is_admin_only_mode(),
-                        exceptions_count,
-                        blacklist_count,
-                        enabled,
-                        state.is_group_chat_mode(),
-                        state.get_group_activity_mode(),
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
@@ -2710,22 +3980,32 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             enabled = state.toggle_group_chat_mode()
             mode, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"💬 Общение: {_on_off_ru(enabled)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        mode,
-                        person.get("name", "общий вариант"),
-                        state.get_schedule_mode(),
-                        state.is_admin_only_mode(),
-                        exceptions_count,
-                        blacklist_count,
-                        state.is_group_fire_reaction_mode(),
-                        enabled,
-                        state.get_group_activity_mode(),
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
+                    )
+                )
+            except Exception:
+                pass
+            return
+        if action == "toggle_public_private_chat_mode":
+            if not await _ensure_admin(update, context):
+                return
+            enabled = state.toggle_public_private_chat_mode()
+            mode, person = _chat_person_mode(context, chat_id)
+            await query.answer(f"Личка для всех: {_on_off_ru(enabled)}")
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
@@ -2736,26 +4016,199 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             new_mode = state.cycle_group_activity_mode()
             mode, person = _chat_person_mode(context, chat_id)
-            exceptions_count = len(state.list_access_exceptions())
-            blacklist_count = len(state.get_blacklist_phrases())
             await query.answer(f"🎚 Активность: {_group_activity_ru(new_mode)}")
             try:
                 await query.message.edit_reply_markup(
-                    reply_markup=_settings_keyboard(
-                        mode,
-                        person.get("name", "общий вариант"),
-                        state.get_schedule_mode(),
-                        state.is_admin_only_mode(),
-                        exceptions_count,
-                        blacklist_count,
-                        state.is_group_fire_reaction_mode(),
-                        state.is_group_chat_mode(),
-                        new_mode,
-                        len(state.get_style_examples()),
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
                     )
                 )
             except Exception:
                 pass
+            return
+        if action == "toggle_social_mode":
+            if not await _ensure_admin(update, context):
+                return
+            new_mode = state.cycle_social_mode()
+            mode, person = _chat_person_mode(context, chat_id)
+            await query.answer(f"Соц режим: {_social_mode_ru(new_mode)}")
+            try:
+                await query.message.edit_reply_markup(
+                    reply_markup=_settings_markup_for_chat(
+                        context=context,
+                        chat_id=chat_id,
+                        mode=mode,
+                        person_name=person.get("name", "общий вариант"),
+                    )
+                )
+            except Exception:
+                pass
+            return
+        if action == "roast":
+            if not await _ensure_admin(update, context):
+                return
+            await query.answer()
+            await query.message.reply_text(
+                "Список дружеских подколов/обзывалок.\n"
+                "Используются аккуратно в режиме самообучения.",
+                reply_markup=_roast_keyboard(state),
+            )
+            return
+        if action == "roast_show":
+            if not await _ensure_admin(update, context):
+                return
+            await query.answer()
+            roast_words = state.get_roast_words()
+            text_lines = [f"{idx}. {item}" for idx, item in enumerate(roast_words, start=1)]
+            await query.message.reply_text("Подколы/обзывалки:\n" + "\n".join(text_lines))
+            return
+        if action == "roast_add":
+            if not await _ensure_admin(update, context):
+                return
+            await query.answer()
+            _set_pending_input(context, chat_id=chat_id, user_id=query.from_user.id, action="roast_add")
+            await query.message.reply_text(
+                "Пришли слова/фразы для дружеских подколов.\n"
+                "Можно через запятую или каждую с новой строки."
+            )
+            return
+        if action == "roast_reset":
+            if not await _ensure_admin(update, context):
+                return
+            state.reset_roast_words()
+            await query.answer("Сбросил")
+            await query.message.reply_text("Список подколов сброшен к базовому.", reply_markup=_roast_keyboard(state))
+            return
+        if action == "relations":
+            if not await _ensure_admin(update, context):
+                return
+            relation_chat_id = _effective_group_chat_id(context) or chat_id
+            if len(parts) == 3:
+                try:
+                    relation_chat_id = int(parts[2])
+                except Exception:
+                    relation_chat_id = _effective_group_chat_id(context) or chat_id
+            await query.answer()
+            await query.message.reply_text(
+                f"Рейтинг людей (чат {relation_chat_id}):",
+                reply_markup=_relations_keyboard(state=state, relation_chat_id=relation_chat_id),
+            )
+            return
+        if action == "rel_user" and len(parts) == 4:
+            if not await _ensure_admin(update, context):
+                return
+            try:
+                relation_chat_id = int(parts[2])
+                target_user_id = int(parts[3])
+            except Exception:
+                await query.answer("Ошибка")
+                return
+            relation = state.get_relation(chat_id=relation_chat_id, user_id=target_user_id)
+            if not relation:
+                await query.answer("Нет данных")
+                return
+            grudges = relation.get("grudges", [])
+            if not isinstance(grudges, list):
+                grudges = []
+            grudge_line = ", ".join(str(item) for item in grudges[-5:] if str(item).strip()) or "нет"
+            await query.answer()
+            await query.message.reply_text(
+                f"Профиль: {_relation_display_name(relation)}\n"
+                f"- user_id: {target_user_id}\n"
+                f"- рейтинг: {int(relation.get('score', 0)):+d}\n"
+                f"- статус: {_relation_status_ru(str(relation.get('status', 'neutral')))}\n"
+                f"- доброжелательных сигналов: {int(relation.get('friendly_hits', 0))}\n"
+                f"- грубых сигналов: {int(relation.get('rude_hits', 0))}\n"
+                f"- прощение заблокировано: {'да' if relation.get('forgive_blocked', False) else 'нет'}\n"
+                f"- последняя причина: {relation.get('last_reason', 'нет')}\n"
+                f"- обиды: {grudge_line}",
+                reply_markup=_relation_adjust_keyboard(
+                    relation_chat_id=relation_chat_id,
+                    user_id=target_user_id,
+                ),
+            )
+            return
+        if action == "rel_adj" and len(parts) == 5:
+            if not await _ensure_admin(update, context):
+                return
+            try:
+                relation_chat_id = int(parts[2])
+                target_user_id = int(parts[3])
+                delta = int(parts[4])
+            except Exception:
+                await query.answer("Ошибка")
+                return
+            safe_delta = _safe_relation_delta(context, target_user_id, delta)
+            relation = state.adjust_relation_score(
+                chat_id=relation_chat_id,
+                user_id=target_user_id,
+                delta=safe_delta,
+                reason="админ изменил рейтинг",
+                text="manual_adjustment",
+            )
+            relation = _ensure_admin_relation_floor(
+                context=context,
+                state=state,
+                chat_id=relation_chat_id,
+                user_id=target_user_id,
+            ) or relation
+            await query.answer(f"Рейтинг: {int(relation.get('score', 0)):+d}")
+            await query.message.reply_text(
+                f"Обновил: {_relation_display_name(relation)} -> {int(relation.get('score', 0)):+d} "
+                f"({_relation_status_ru(str(relation.get('status', 'neutral')))})",
+                reply_markup=_relation_adjust_keyboard(
+                    relation_chat_id=relation_chat_id,
+                    user_id=target_user_id,
+                ),
+            )
+            return
+        if action == "rel_set" and len(parts) == 5:
+            if not await _ensure_admin(update, context):
+                return
+            try:
+                relation_chat_id = int(parts[2])
+                target_user_id = int(parts[3])
+                score = int(parts[4])
+            except Exception:
+                await query.answer("Ошибка")
+                return
+            safe_score = _safe_relation_score(context, target_user_id, score)
+            relation = state.set_relation_score(
+                chat_id=relation_chat_id,
+                user_id=target_user_id,
+                score=safe_score,
+                reason="админ задал рейтинг",
+            )
+            await query.answer(f"Рейтинг: {int(relation.get('score', 0)):+d}")
+            await query.message.reply_text(
+                f"Установил рейтинг: {_relation_display_name(relation)} -> {int(relation.get('score', 0)):+d}",
+                reply_markup=_relation_adjust_keyboard(
+                    relation_chat_id=relation_chat_id,
+                    user_id=target_user_id,
+                ),
+            )
+            return
+        if action == "rel_prompt" and len(parts) == 4:
+            if not await _ensure_admin(update, context):
+                return
+            try:
+                relation_chat_id = int(parts[2])
+                target_user_id = int(parts[3])
+            except Exception:
+                await query.answer("Ошибка")
+                return
+            await query.answer()
+            _set_pending_input(
+                context,
+                chat_id=chat_id,
+                user_id=query.from_user.id,
+                action="set_relation_score",
+                payload={"relation_chat_id": relation_chat_id, "target_user_id": target_user_id},
+            )
+            await query.message.reply_text("Напиши новый рейтинг от -100 до 100. Можно с причиной: 35 | за хороший диалог")
             return
         if action == "import_style_examples":
             if not await _ensure_admin(update, context):
@@ -2763,8 +4216,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer()
             _set_pending_input(context, chat_id=chat_id, user_id=query.from_user.id, action="import_style_examples")
             await query.message.reply_text(
-                "Отправь JSON/TXT файл с экспортом переписки.\n"
+                "Отправь JSON/TXT/HTML файл с экспортом переписки.\n"
                 "JSON: telegram desktop export (result.json).\n"
+                "HTML: telegram desktop export (messages.html).\n"
                 "TXT: по одной фразе на строку.\n"
                 "Возьму стиль твоих сообщений и применю в режиме общения."
             )
@@ -2934,6 +4388,80 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "Если фраза в списке, бот старается не использовать похожие куски текста.",
                 reply_markup=_blacklist_keyboard(),
             )
+            return
+        if action == "export_chats":
+            if not await _ensure_admin(update, context):
+                return
+            await query.answer()
+            await query.message.reply_text(
+                "Выбери пользователя для экспорта переписки:",
+                reply_markup=_user_export_keyboard(context),
+            )
+            return
+        if action == "export_user" and len(parts) == 3:
+            if not await _ensure_admin(update, context):
+                return
+            try:
+                target_user_id = int(parts[2])
+            except Exception:
+                await query.answer("Ошибка")
+                return
+            await query.answer("Готовлю экспорт")
+            rows = _iter_chat_log_rows(context, reverse=False)
+            user_rows = [
+                row
+                for row in rows
+                if int(row.get("user_id", 0) or 0) == target_user_id
+                or int(row.get("peer_user_id", 0) or 0) == target_user_id
+            ]
+            if not user_rows:
+                await query.message.reply_text("Для этого пользователя пока нет записей.")
+                return
+            lines: list[str] = []
+            for row in user_rows:
+                ts = str(row.get("ts", "") or "")
+                chat_id_row = int(row.get("chat_id", 0) or 0)
+                direction = str(row.get("direction", "") or "")
+                username = str(row.get("username", "") or "")
+                first_name = str(row.get("first_name", "") or "")
+                last_name = str(row.get("last_name", "") or "")
+                name = " ".join(part for part in (first_name, last_name) if part).strip()
+                if username:
+                    uname = f"@{username}"
+                    name = f"{name} ({uname})" if name else uname
+                if not name:
+                    if direction == "outgoing":
+                        name = "бот"
+                    else:
+                        name = str(target_user_id)
+                text_value = " ".join(str(row.get("text", "") or "").split())
+                content_type = str(row.get("content_type", "") or "text")
+                if not text_value:
+                    text_value = f"[{content_type}]"
+                source = str(row.get("source", "") or "")
+                src_suffix = f" source={source}" if source else ""
+                lines.append(f"[{ts}] chat={chat_id_row} {direction} {name}:{src_suffix} {text_value}")
+            export_text = "\n".join(lines)
+            tmp_path = os.path.join(
+                tempfile.gettempdir(),
+                f"chat_export_{target_user_id}_{int(time.time())}.txt",
+            )
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    handle.write(export_text)
+                with open(tmp_path, "rb") as handle:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=handle,
+                        filename=f"chat_export_{target_user_id}.txt",
+                        caption=f"Экспорт сообщений пользователя {target_user_id}",
+                    )
+            finally:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
             return
         if action == "blacklist_show":
             if not await _ensure_admin(update, context):
@@ -3321,6 +4849,7 @@ def main() -> None:
     _schedule_jobs(app, config.timezone)
     _schedule_training_jobs(app, app.bot_data["state"])
 
+    app.add_handler(MessageHandler(filters.ALL, audit_message_router), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text_router))

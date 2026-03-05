@@ -13,6 +13,14 @@ DEFAULT_SCHEDULE_MODE = "standard"
 VALID_SCHEDULE_MODES = {"short", "standard", "context"}
 DEFAULT_GROUP_ACTIVITY_MODE = "normal"
 VALID_GROUP_ACTIVITY_MODES = {"quiet", "normal", "active", "question_only"}
+DEFAULT_SOCIAL_MODE = "self_learning"
+VALID_SOCIAL_MODES = {"self_learning", "style_clone"}
+DEFAULT_ROAST_WORDS = [
+    "ахахах",
+    "скуфяра",
+    "ну ты бездарь",
+    "бяка",
+]
 
 
 class BotStateStore:
@@ -44,8 +52,12 @@ class BotStateStore:
             "runtime_group_chat_id": 0,
             "group_fire_reaction_mode": False,
             "group_chat_mode": False,
+            "public_private_chat_mode": False,
             "group_activity_mode": DEFAULT_GROUP_ACTIVITY_MODE,
             "style_examples": [],
+            "social_mode": DEFAULT_SOCIAL_MODE,
+            "roast_words": list(DEFAULT_ROAST_WORDS),
+            "user_relations": {},
         }
 
     def _load(self) -> dict[str, Any]:
@@ -107,6 +119,11 @@ class BotStateStore:
         if "group_chat_mode" not in self._data or not isinstance(self._data["group_chat_mode"], bool):
             self._data["group_chat_mode"] = False
             changed = True
+        if "public_private_chat_mode" not in self._data or not isinstance(
+            self._data["public_private_chat_mode"], bool
+        ):
+            self._data["public_private_chat_mode"] = False
+            changed = True
         if (
             "group_activity_mode" not in self._data
             or str(self._data["group_activity_mode"]).strip().lower() not in VALID_GROUP_ACTIVITY_MODES
@@ -115,6 +132,15 @@ class BotStateStore:
             changed = True
         if "style_examples" not in self._data or not isinstance(self._data["style_examples"], list):
             self._data["style_examples"] = []
+            changed = True
+        if "social_mode" not in self._data or str(self._data["social_mode"]).strip().lower() not in VALID_SOCIAL_MODES:
+            self._data["social_mode"] = DEFAULT_SOCIAL_MODE
+            changed = True
+        if "roast_words" not in self._data or not isinstance(self._data["roast_words"], list):
+            self._data["roast_words"] = list(DEFAULT_ROAST_WORDS)
+            changed = True
+        if "user_relations" not in self._data or not isinstance(self._data["user_relations"], dict):
+            self._data["user_relations"] = {}
             changed = True
         if str(DEFAULT_PERSON_ID) not in self._data["personas"]:
             self._data["personas"][str(DEFAULT_PERSON_ID)] = {
@@ -553,6 +579,18 @@ class BotStateStore:
         new_value = not self.is_group_chat_mode()
         return self.set_group_chat_mode(new_value)
 
+    def is_public_private_chat_mode(self) -> bool:
+        return bool(self._data.get("public_private_chat_mode", False))
+
+    def set_public_private_chat_mode(self, enabled: bool) -> bool:
+        self._data["public_private_chat_mode"] = bool(enabled)
+        self._save()
+        return bool(enabled)
+
+    def toggle_public_private_chat_mode(self) -> bool:
+        new_value = not self.is_public_private_chat_mode()
+        return self.set_public_private_chat_mode(new_value)
+
     def get_group_activity_mode(self) -> str:
         mode = str(self._data.get("group_activity_mode", DEFAULT_GROUP_ACTIVITY_MODE)).strip().lower()
         if mode not in VALID_GROUP_ACTIVITY_MODES:
@@ -578,6 +616,199 @@ class BotStateStore:
         else:
             new_mode = "quiet"
         return self.set_group_activity_mode(new_mode)
+
+    def get_social_mode(self) -> str:
+        mode = str(self._data.get("social_mode", DEFAULT_SOCIAL_MODE)).strip().lower()
+        if mode not in VALID_SOCIAL_MODES:
+            mode = DEFAULT_SOCIAL_MODE
+        return mode
+
+    def set_social_mode(self, mode: str) -> str:
+        clean = str(mode).strip().lower()
+        if clean not in VALID_SOCIAL_MODES:
+            raise ValueError("unsupported social_mode")
+        self._data["social_mode"] = clean
+        self._save()
+        return clean
+
+    def cycle_social_mode(self) -> str:
+        now = self.get_social_mode()
+        new_mode = "style_clone" if now == "self_learning" else "self_learning"
+        return self.set_social_mode(new_mode)
+
+    def get_roast_words(self) -> list[str]:
+        raw = self._data.get("roast_words", [])
+        if not isinstance(raw, list):
+            return list(DEFAULT_ROAST_WORDS)
+        out: list[str] = []
+        for item in raw:
+            clean = " ".join(str(item).strip().split())
+            if clean:
+                out.append(clean)
+        return out or list(DEFAULT_ROAST_WORDS)
+
+    def add_roast_words(self, words: list[str], limit: int = 100) -> int:
+        current = self.get_roast_words()
+        seen = {self._norm_phrase_key(x) for x in current}
+        added = 0
+        for item in words:
+            clean = " ".join(str(item).strip().split())
+            if not clean:
+                continue
+            norm = self._norm_phrase_key(clean)
+            if not norm or norm in seen:
+                continue
+            current.append(clean)
+            seen.add(norm)
+            added += 1
+        if len(current) > max(1, limit):
+            current = current[-max(1, limit):]
+        self._data["roast_words"] = current
+        self._save()
+        return added
+
+    def reset_roast_words(self) -> None:
+        self._data["roast_words"] = list(DEFAULT_ROAST_WORDS)
+        self._save()
+
+    @staticmethod
+    def _relation_key(chat_id: int, user_id: int) -> str:
+        return f"{int(chat_id)}:{int(user_id)}"
+
+    def get_or_create_relation(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        first_name: str = "",
+        last_name: str = "",
+        username: str = "",
+    ) -> dict[str, Any]:
+        key = self._relation_key(chat_id, user_id)
+        raw = self._data.setdefault("user_relations", {}).get(key)
+        if not isinstance(raw, dict):
+            raw = {
+                "chat_id": int(chat_id),
+                "user_id": int(user_id),
+                "first_name": str(first_name).strip(),
+                "last_name": str(last_name).strip(),
+                "username": str(username).strip(),
+                "score": 0,
+                "status": "neutral",
+                "friendly_hits": 0,
+                "rude_hits": 0,
+                "forgive_blocked": False,
+                "grudges": [],
+                "last_reason": "",
+                "last_text": "",
+            }
+            self._data["user_relations"][key] = raw
+            self._save()
+        else:
+            if first_name:
+                raw["first_name"] = str(first_name).strip()
+            if last_name:
+                raw["last_name"] = str(last_name).strip()
+            if username:
+                raw["username"] = str(username).strip()
+        return dict(raw)
+
+    def _status_by_score(self, score: int) -> str:
+        if score >= 35:
+            return "friendly"
+        if score >= 12:
+            return "warm"
+        if score <= -45:
+            return "hostile"
+        if score <= -18:
+            return "cold"
+        return "neutral"
+
+    def adjust_relation_score(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        delta: int,
+        reason: str = "",
+        text: str = "",
+        first_name: str = "",
+        last_name: str = "",
+        username: str = "",
+    ) -> dict[str, Any]:
+        key = self._relation_key(chat_id, user_id)
+        relation = self.get_or_create_relation(
+            chat_id=chat_id,
+            user_id=user_id,
+            first_name=first_name,
+            last_name=last_name,
+            username=username,
+        )
+        score = int(relation.get("score", 0)) + int(delta)
+        score = max(-100, min(100, score))
+        relation["score"] = score
+        relation["status"] = self._status_by_score(score)
+        relation["last_reason"] = " ".join(str(reason).split())[:180]
+        relation["last_text"] = " ".join(str(text).split())[:300]
+        if int(delta) > 0:
+            relation["friendly_hits"] = int(relation.get("friendly_hits", 0)) + 1
+        elif int(delta) < 0:
+            relation["rude_hits"] = int(relation.get("rude_hits", 0)) + 1
+            grudge = " ".join(str(reason).split())
+            if grudge:
+                grudges = relation.get("grudges", [])
+                if not isinstance(grudges, list):
+                    grudges = []
+                grudges.append(grudge[:120])
+                relation["grudges"] = grudges[-40:]
+        if score <= -65:
+            relation["forgive_blocked"] = True
+        self._data.setdefault("user_relations", {})[key] = relation
+        self._save()
+        return dict(relation)
+
+    def set_relation_score(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        score: int,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        relation = self.get_or_create_relation(chat_id=chat_id, user_id=user_id)
+        target = max(-100, min(100, int(score)))
+        relation["score"] = target
+        relation["status"] = self._status_by_score(target)
+        if reason:
+            relation["last_reason"] = " ".join(str(reason).split())[:180]
+        if target <= -65:
+            relation["forgive_blocked"] = True
+        key = self._relation_key(chat_id, user_id)
+        self._data.setdefault("user_relations", {})[key] = relation
+        self._save()
+        return dict(relation)
+
+    def get_relation(self, *, chat_id: int, user_id: int) -> dict[str, Any] | None:
+        key = self._relation_key(chat_id, user_id)
+        raw = self._data.get("user_relations", {}).get(key)
+        if not isinstance(raw, dict):
+            return None
+        return dict(raw)
+
+    def list_chat_relations(self, *, chat_id: int, limit: int = 80) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        raw = self._data.get("user_relations", {})
+        if not isinstance(raw, dict):
+            return out
+        prefix = f"{int(chat_id)}:"
+        for key, value in raw.items():
+            if not str(key).startswith(prefix):
+                continue
+            if not isinstance(value, dict):
+                continue
+            out.append(dict(value))
+        out.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+        return out[: max(1, int(limit))]
 
     def get_style_examples(self) -> list[str]:
         raw = self._data.get("style_examples", [])
