@@ -169,6 +169,7 @@ EMOJI_SEQUENCE_RE = re.compile(
     r"(?:\uFE0F)?(?:\u200D[\U0001F300-\U0001FAFF\u2600-\u27BF](?:\uFE0F)?)*)"
 )
 HTML_TAG_RE = re.compile(r"<[^>]+>")
+MOJIBAKE_CHARS = ("�", "Ð", "Ñ", "Ã", "Ø", "Â")
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -1046,6 +1047,37 @@ def _plain_text_for_blacklist(text: str) -> str:
     lowered = no_tags.lower().replace("ё", "е")
     cleaned = re.sub(r"[^a-zа-я0-9\s]+", " ", lowered)
     return " ".join(cleaned.split())
+
+
+def _looks_like_bad_language_output(text: str) -> bool:
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return True
+    if any(ch in raw for ch in MOJIBAKE_CHARS):
+        return True
+
+    letters = [ch for ch in raw if ch.isalpha()]
+    if not letters:
+        return False
+
+    def _is_cjk(ch: str) -> bool:
+        code = ord(ch)
+        return (
+            0x4E00 <= code <= 0x9FFF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x3040 <= code <= 0x309F
+            or 0x30A0 <= code <= 0x30FF
+            or 0xAC00 <= code <= 0xD7AF
+        )
+
+    cjk_count = sum(1 for ch in letters if _is_cjk(ch))
+    if cjk_count >= 2 and (cjk_count / max(1, len(letters))) >= 0.12:
+        return True
+
+    cyr_or_lat_count = sum(1 for ch in letters if ("а" <= ch.lower() <= "я") or ("a" <= ch.lower() <= "z"))
+    if cyr_or_lat_count / max(1, len(letters)) < 0.55:
+        return True
+    return False
 
 
 def _blacklist_tokens(text: str) -> list[str]:
@@ -2020,21 +2052,26 @@ async def _send_wish(
     openai_used = False
     if config.openai_enabled:
         try:
-            openai_text = await generate_openai_wish(
-                cfg=_openai_runtime_cfg(config),
-                kind=kind,
-                mode=mode,
-                audience=audience,
-                person_name=person_name if audience == "single" else "",
-                person_instructions=person_instructions if audience == "single" else "",
-                blacklist=blacklist,
-                recent_texts=recent_texts[-12:],
-                preferred_emojis=liked_emojis[-40:],
+            openai_text = await asyncio.wait_for(
+                generate_openai_wish(
+                    cfg=_openai_runtime_cfg(config),
+                    kind=kind,
+                    mode=mode,
+                    audience=audience,
+                    person_name=person_name if audience == "single" else "",
+                    person_instructions=person_instructions if audience == "single" else "",
+                    blacklist=blacklist,
+                    recent_texts=recent_texts[-12:],
+                    preferred_emojis=liked_emojis[-40:],
+                ),
+                timeout=min(18.0, max(6.0, float(config.openai_timeout_sec))),
             )
             candidate_text = " ".join(openai_text.split())
             reject_reason = ""
             if not candidate_text:
                 reject_reason = "empty"
+            elif _looks_like_bad_language_output(candidate_text):
+                reject_reason = "bad_language"
             elif _contains_blacklisted_phrase(candidate_text, blacklist):
                 stripped = _strip_blacklisted_sentences(candidate_text, blacklist)
                 if stripped and not _contains_blacklisted_phrase(stripped, blacklist):
@@ -2075,6 +2112,12 @@ async def _send_wish(
                 config.openai_base_url,
                 config.openai_model,
                 exc,
+            )
+        except asyncio.TimeoutError:
+            logging.warning(
+                "LLM wish generation timeout endpoint=%s model=%s",
+                config.openai_base_url,
+                config.openai_model,
             )
         except Exception as exc:
             logging.exception(
@@ -3209,6 +3252,9 @@ def _should_reply_in_group(
     if _is_direct_group_addressing(context=context, message=message, text=text):
         return True
 
+    if len(" ".join(str(text or "").split())) <= 2:
+        return False
+
     chance = 0.10 if mode == "quiet" else GROUP_CHAT_REPLY_CHANCE
     if _looks_like_question(text):
         chance += 0.20
@@ -3319,19 +3365,24 @@ async def _generate_group_chat_reply(
 
     if config.openai_enabled and not prefer_local_hostile:
         try:
-            text = await generate_openai_chat_reply(
-                cfg=_openai_runtime_cfg(config),
-                incoming_text=incoming_text,
-                recent_dialogue=recent_dialogue,
-                style_examples=style_examples,
-                bot_name=str(getattr(context.bot, "first_name", "") or getattr(context.bot, "username", "") or "бот"),
-                social_mode=social_mode,
-                relation_summary=relation_summary,
-                roast_words=roast_words,
+            text = await asyncio.wait_for(
+                generate_openai_chat_reply(
+                    cfg=_openai_runtime_cfg(config),
+                    incoming_text=incoming_text,
+                    recent_dialogue=recent_dialogue,
+                    style_examples=style_examples,
+                    bot_name=str(getattr(context.bot, "first_name", "") or getattr(context.bot, "username", "") or "бот"),
+                    social_mode=social_mode,
+                    relation_summary=relation_summary,
+                    roast_words=roast_words,
+                ),
+                timeout=min(12.0, max(4.0, float(config.openai_timeout_sec))),
             )
             clean = " ".join(str(text).split())
             if clean:
-                if _contains_blacklisted_phrase(clean, blacklist):
+                if _looks_like_bad_language_output(clean):
+                    logging.info("Group chat LLM text rejected: bad_language")
+                elif _contains_blacklisted_phrase(clean, blacklist):
                     stripped = _strip_blacklisted_sentences(clean, blacklist)
                     if stripped and not _contains_blacklisted_phrase(stripped, blacklist):
                         return stripped, "openai_stripped"
@@ -3339,6 +3390,8 @@ async def _generate_group_chat_reply(
                     return clean, "openai"
         except OpenAIWishError as exc:
             logging.warning("Group chat LLM failed: %s", exc)
+        except asyncio.TimeoutError:
+            logging.warning("Group chat LLM failed: timeout")
         except Exception as exc:
             logging.exception("Unexpected group chat LLM error: %s", exc)
 
