@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from typing import Awaitable, Callable
+from urllib.parse import quote, quote_plus
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -922,46 +923,181 @@ def _time_answer_from_query(query: str) -> str | None:
 
 async def _web_lookup_answer(query: str) -> str:
     timeout = httpx.Timeout(connect=4.0, read=GROUP_QUERY_TIMEOUT_SEC, write=8.0, pool=4.0)
-    params = {
-        "q": query,
-        "format": "json",
-        "no_html": "1",
-        "skip_disambig": "1",
-        "no_redirect": "1",
-        "kl": "ru-ru",
-    }
-    url = "https://api.duckduckgo.com/"
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(url, params=params)
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code}")
-    data = response.json()
-    candidates = [
-        str(data.get("Answer", "")).strip(),
-        str(data.get("AbstractText", "")).strip(),
-        str(data.get("Definition", "")).strip(),
-    ]
-    answer = next((value for value in candidates if value), "")
-    if not answer:
+
+    def _clean_snippet(raw: str) -> str:
+        text = HTML_TAG_RE.sub(" ", str(raw or ""))
+        text = html.unescape(text)
+        return " ".join(text.split())
+
+    def _compact(text: str, *, limit: int = 420) -> str:
+        clean = " ".join(str(text or "").split())
+        if len(clean) <= limit:
+            return clean
+        return f"{clean[: limit - 3].rstrip()}..."
+
+    def _is_good_direct_answer(text: str) -> bool:
+        clean = " ".join(str(text or "").split())
+        if not clean:
+            return False
+        if len(clean) < 25:
+            return False
+        if clean.lower().startswith("see "):
+            return False
+        if _looks_like_bad_language_output(clean):
+            return False
+        return True
+
+    def _dedupe_lines(lines: list[str], limit: int = 5) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for line in lines:
+            clean = " ".join(str(line or "").split())
+            if len(clean) < 20:
+                continue
+            key = _plain_text_for_blacklist(clean)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(clean)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _strip_query_noise(raw_query: str) -> str:
+        clean = " ".join(str(raw_query or "").split())
+        if not clean:
+            return ""
+        patterns = [
+            r"(?i)^\s*(сколько|какой|какая|какие|когда|где|кто|что|почему|зачем|как)\s+",
+            r"(?i)\s*(википедия|wiki)\s*$",
+            r"(?i)\s*(пожалуйста|плиз)\s*$",
+            r"(?i)\s*(найди|поиск)\s+",
+        ]
+        for pattern in patterns:
+            clean = re.sub(pattern, " ", clean)
+        return " ".join(clean.split())
+
+    def _build_summary(snippets: list[str]) -> str:
+        items = _dedupe_lines(snippets, limit=3)
+        if not items:
+            return "Пока не нашел надежный ответ. Уточни запрос чуть конкретнее."
+        if len(items) == 1:
+            return _compact(items[0], limit=500)
+        lines = ["Коротко по запросу:"]
+        for item in items:
+            lines.append(f"• {_compact(item, limit=220)}")
+        return "\n".join(lines)
+
+    async def _duckduckgo_instant(client: httpx.AsyncClient, q: str) -> str | None:
+        params = {
+            "q": q,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+            "no_redirect": "1",
+            "kl": "ru-ru",
+        }
+        response = await client.get("https://api.duckduckgo.com/", params=params)
+        if response.status_code >= 400:
+            return None
+        try:
+            data = response.json()
+        except Exception:
+            return None
+        direct_candidates = [
+            str(data.get("Answer", "")).strip(),
+            str(data.get("AbstractText", "")).strip(),
+            str(data.get("Definition", "")).strip(),
+        ]
+        direct = next((candidate for candidate in direct_candidates if _is_good_direct_answer(candidate)), "")
+        if direct:
+            return _compact(direct, limit=500)
+
+        snippets: list[str] = []
         related = data.get("RelatedTopics", [])
         if isinstance(related, list):
             for item in related:
-                if isinstance(item, dict) and str(item.get("Text", "")).strip():
-                    answer = str(item["Text"]).strip()
-                    break
-                topics = item.get("Topics") if isinstance(item, dict) else None
-                if isinstance(topics, list):
-                    for sub in topics:
-                        if isinstance(sub, dict) and str(sub.get("Text", "")).strip():
-                            answer = str(sub["Text"]).strip()
-                            break
-                    if answer:
-                        break
-    if not answer:
-        return "Точного ответа не нашел. Уточни запрос."
-    if len(answer) > 500:
-        answer = f"{answer[:497]}..."
-    return answer
+                if isinstance(item, dict):
+                    text = str(item.get("Text", "")).strip()
+                    if text:
+                        snippets.append(_clean_snippet(text))
+                    topics = item.get("Topics")
+                    if isinstance(topics, list):
+                        for sub in topics:
+                            if isinstance(sub, dict):
+                                sub_text = str(sub.get("Text", "")).strip()
+                                if sub_text:
+                                    snippets.append(_clean_snippet(sub_text))
+        if snippets:
+            return _build_summary(snippets)
+        return None
+
+    async def _wikipedia_summary(client: httpx.AsyncClient, q: str) -> str | None:
+        search_query = _strip_query_noise(q)
+        if len(search_query) < 2:
+            return None
+        lang_candidates = ["ru", "en"]
+        for lang in lang_candidates:
+            try:
+                opensearch_url = f"https://{lang}.wikipedia.org/w/api.php"
+                opensearch_params = {
+                    "action": "opensearch",
+                    "search": search_query,
+                    "limit": 1,
+                    "namespace": 0,
+                    "format": "json",
+                }
+                search_resp = await client.get(opensearch_url, params=opensearch_params)
+                if search_resp.status_code >= 400:
+                    continue
+                payload = search_resp.json()
+                title = ""
+                if isinstance(payload, list) and len(payload) > 1 and isinstance(payload[1], list) and payload[1]:
+                    title = str(payload[1][0]).strip()
+                if not title:
+                    continue
+                summary_url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
+                summary_resp = await client.get(summary_url)
+                if summary_resp.status_code >= 400:
+                    continue
+                summary_data = summary_resp.json()
+                extract = _clean_snippet(str(summary_data.get("extract", "") or ""))
+                if _is_good_direct_answer(extract):
+                    return _compact(extract, limit=500)
+            except Exception:
+                continue
+        return None
+
+    async def _duckduckgo_html_snippets(client: httpx.AsyncClient, q: str) -> list[str]:
+        url = f"https://duckduckgo.com/html/?q={quote_plus(q)}&kl=ru-ru"
+        response = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if response.status_code >= 400:
+            return []
+        page = response.text
+        snippets_raw = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, flags=re.IGNORECASE | re.DOTALL)
+        if not snippets_raw:
+            snippets_raw = re.findall(
+                r'<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
+                page,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        snippets = [_clean_snippet(value) for value in snippets_raw]
+        return _dedupe_lines(snippets, limit=6)
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        instant = await _duckduckgo_instant(client, query)
+        if instant:
+            return instant
+
+        wiki = await _wikipedia_summary(client, query)
+        if wiki:
+            return wiki
+
+        snippets = await _duckduckgo_html_snippets(client, query)
+        if snippets:
+            return _build_summary(snippets)
+
+    return "Нашел мало данных. Добавь уточнение: место, дату или предмет вопроса."
 
 
 async def _answer_v_query(query: str) -> str:
